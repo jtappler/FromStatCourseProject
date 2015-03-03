@@ -1,0 +1,122 @@
+# Parking War Project
+
+***
+### Setup 
+***
+
+```{r, message=FALSE}
+# Load packages
+source("check_packages.R")
+check_packages(c("devtools", "data.table", "tidyr", "stringr", "rgdal", "rgeos", "httr", "rjson", "RDSTK", "date", "lubridate", "Rcpp","sp", "mvoutlier", "outliers", "e1071", "raster"))
+
+
+# Install updated devtools from GitHub repo to prevent crash
+if (compareVersion(toString(packageVersion("dplyr")), "0.3.0.9000") == -1) {
+  devtools::install_github("hadley/dplyr")
+}
+require(dplyr)
+```
+
+### Task 1
+***
+```{r, message=FALSE}
+# Read in data
+### This read in small data for sake of testing
+dat.master = tbl_df(read.csv("/home/vis/cr173/Sta523/data/parking/NYParkingViolations.csv",stringsAsFactors=FALSE))
+
+#choose right issue date & correct precincts
+dat.master$Issue.Date = mdy(dat.master$Issue.Date)
+dat.subset = filter(dat.master, Issue.Date > "2013/09/01" & Issue.Date < "2014/6/30" & (Violation.Precinct == 1 | Violation.Precinct == 5 | Violation.Precinct == 6 | Violation.Precinct == 7 | Violation.Precinct == 9 | Violation.Precinct == 10 | Violation.Precinct == 13 | Violation.Precinct == 14 | Violation.Precinct == 17 | Violation.Precinct == 18 | Violation.Precinct == 19 | Violation.Precinct == 20 | Violation.Precinct == 22 | Violation.Precinct == 23 | Violation.Precinct == 24 | Violation.Precinct == 25 | Violation.Precinct == 26 | Violation.Precinct == 28 | Violation.Precinct == 30 | Violation.Precinct == 32 | Violation.Precinct == 33 | Violation.Precinct == 34))
+
+# Select and clean addresses
+addr <- select(dat.subset, Street.Code1, Street.Code2, Street.Code3, Street.Name, Intersecting.Street, House.Number, Violation.Precinct) %>% mutate(House.Number = str_trim(House.Number)) %>%
+       filter(House.Number != "" & Street.Name != "") %>%
+       filter(str_detect(House.Number,"[0-9]+")) %>%
+       mutate(Street.Name = toupper(Street.Name)) %>%
+       mutate(Street.Name = str_replace(Street.Name,"TH "," ")) %>%
+       mutate(Street.Name = str_replace(Street.Name, "([0-9]+)ST","\\1")) %>%
+       mutate(Street.Name = str_replace(Street.Name, "([0-9]+)RD","\\1")) %>%
+       mutate(Street.Name = str_replace(Street.Name, "([0-9]+)ND","\\1")) %>%
+       mutate(Street.Name = str_trim(Street.Name)) %>%
+       transmute(Violation.Precinct = Violation.Precinct, addr = paste(House.Number, Street.Name)) %>%
+       mutate(addr = toupper(addr))
+
+
+base = '/home/vis/cr173/Sta523/data/parking'
+pl = readOGR(paste0(base,"/pluto/Manhattan/"),"MNMapPLUTO")
+
+pt = gCentroid(pl,byid=TRUE)
+tax = cbind(data.frame(pt@coords), as.character(pl@data$Address))
+names(tax)[3] = "addr"
+z = inner_join(addr, tax)
+
+
+#### Remove outliers using mvoutlier package
+outs <-  na.omit(data.matrix(z[,2:4]))
+outs <- data.frame(outs)
+outs$Violation.Precinct <- as.factor(outs$Violation.Precinct)
+splt <- split(outs, outs$Violation.Precinct) 
+
+test <- lapply(splt, function(x){
+      d <- data.matrix(x)
+      cbind(scores(d[,2:3]), x)
+})
+t1 <- ldply(test, data.frame)
+addr2 <- filter(t1, abs(x) < 5 &  abs(y) < 5) %>%
+            select(Violation.Precinct, x.1, y.1)
+# summary(factor(addr2$Violation.Precinct))
+addr2$x <- addr2$x.1
+addr2$y <- addr2$y.1
+
+addr <- select(addr2, Violation.Precinct, x, y)
+```
+
+> After loading in the data and using the dplyr package to perform basic cleaning tasks, we calculate standardized outlier scores for lattitude and longitude within each precinct, and eliminate any data points with a score who's absolute value is > 5. We do this in an effort to eliminate any points with grossly misclassified validation precincts. The removal of these points should help keep our precinct boarders from being pulled away from their true value by a few facicious outliers. 
+
+
+### Task 2
+***
+
+```{r, message=FALSE}
+#SVM
+k=svm(as.factor(Violation.Precinct)~.,data=addr,cross=5)
+
+nybb = readOGR(path.expand("/home/vis/cr173/Sta523/data/parking/nybb/"),"nybb",stringsAsFactors=FALSE)
+manh = nybb[2,]
+
+library(raster)
+r = rasterize(manh, raster(ncols=500,nrows=1000,ext=extent(bbox(manh))))
+
+cells = which(!is.na(r[]))
+crds = xyFromCell(r,cells)
+
+z = predict(k,crds)
+
+r[cells] = as.numeric(as.character(z))
+
+dist = sort(unique(addr$Violation.Precinct))
+index=which(!(dist %in% r[]))
+dist = dist[-index]
+
+l=list()
+for(i in seq_along(dist))
+{
+  l[[i]] = rasterToPolygons(r, function(x) x==dist[i], dissolve=TRUE)
+  l[[i]]@polygons[[1]]@ID = as.character(dist[i])
+  rownames(l[[i]]@data) = dist[i]
+  colnames(l[[i]]@data) = "Precinct"
+}
+
+pd = do.call(rbind, l)
+
+
+
+writeOGR(pd, "./out", "", driver="GeoJSON")
+file.rename("./out", "./precinct_svm.json")
+
+
+# alpha affects alpha blending (makes things transparent), useful if polys may overlap
+plot(pd,main = "precinct_svm.json", axes=TRUE, col=adjustcolor(2:6,alpha=0.5))
+```
+
+> For task 2--the drawing of police precinct boundaries--we use svm to create a supervised learning framework for mapping our violation data to a map of NYC. With incorrectly coded data removed and enough data points along boarder of each precinct this should provide a good approximation of what the police precincts in Manhattan look like.
